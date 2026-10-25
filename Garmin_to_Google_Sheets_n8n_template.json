@@ -1,0 +1,385 @@
+{
+  "name": "Garmin Personal API to Google Sheets (365 days)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "098e5dea-9674-484f-925b-096437f1dca1",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        176,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://personal.connectapi.garmin.com/personalapitoken-service/personal-api/personal-api-key/token",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "d9e04313-3d39-40ba-b584-d5d0b876f858",
+      "name": "Get Garmin Token",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        384,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\nlet body = r.data ?? r;\n\nif (typeof body === 'string') {\n  const s = body.trim();\n  try { body = JSON.parse(s); } catch (e) { body = s; }\n}\n\nlet token;\nif (typeof body === 'string') {\n  token = body.replace(/^\"|\"$/g, '');\n} else {\n  token = body.access_token || body.accessToken || body.token || body.jwt || body.id_token;\n}\n\nif (!token || typeof token !== 'string') {\n  const keys = typeof body === 'object' && body ? Object.keys(body).slice(0, 20).join(', ') : typeof body;\n  throw new Error('Token field not found. Available: ' + keys);\n}\nreturn [{ json: { token } }];"
+      },
+      "id": "48033248-61db-4a49-b364-86e7c7b5aef0",
+      "name": "Extract Token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        608,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const token = $('Extract Token').first().json.token;\nconst base = 'https://personal.connectapi.garmin.com';\nconst TOTAL_DAYS = 365;  // always the last 365 days\nconst WINDOW = 28;\nconst DAY = 86400000;\nconst fmt = d => d.toISOString().slice(0, 10);\nconst today = fmt(new Date());\n\nconst endpoints = [\n  { name: 'dailysummaries', path: '/usersummary-service/v2/dailysummaries?startDate={start}&endDate={end}', window: 28 },\n  { name: 'sleep',          path: '/sleep-service/sleep/dailySleepSummariesByDate?startDate={start}&endDate={end}', window: 31 },\n  { name: 'hrv',            path: '/hrv-service/hrv/daily/{start}/{end}' },\n  { name: 'fitnessage',     path: '/fitnessage-service/fitnessage/v2/{day}', todayOnly: true },\n  { name: 'activities',     path: '/activitylist-service/activities/search/activities?startDate={start}&endDate={end}&limit=99' }\n];\n\nconst items = [];\nfor (const e of endpoints) {\n  if (e.todayOnly) {\n    items.push({ json: { name: e.name, url: base + e.path.split('{day}').join(today), token, day: today, forceDay: true } });\n    continue;\n  }\n  const win = e.window || WINDOW;\n  for (let off = 0; off < TOTAL_DAYS; off += win) {\n    const end = fmt(new Date(Date.now() - off * DAY));\n    const start = fmt(new Date(Date.now() - (Math.min(off + win, TOTAL_DAYS) - 1) * DAY));\n    const p = e.path.split('{start}').join(start).split('{end}').join(end);\n    items.push({ json: { name: e.name, url: base + p, token } });\n  }\n}\nreturn items;"
+      },
+      "id": "014d3aa6-1b47-40f7-b599-503529491a04",
+      "name": "Build Requests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        832,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $json.token }}"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2000
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "913129fe-203e-4748-a301-891613f75a06",
+      "name": "Get Garmin Data",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1056,
+        272
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "maxTries": 3,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const reqs = $('Build Requests').all();\nconst res = $input.all();\nconst unwrap = j => {\n  let b = (j && j.body !== undefined) ? j.body : j;\n  if (typeof b === 'string') { try { b = JSON.parse(b); } catch (e) {} }\n  return b;\n};\nconst expand = b => Array.isArray(b) ? b\n  : (b && typeof b === 'object' ? (Object.values(b).find(v => Array.isArray(v)) || [b]) : []);\nconst obj = x => { if (typeof x === 'string') { try { return JSON.parse(x); } catch (e) { return {}; } } return x || {}; };\nconst g = (o, path) => path.split('.').reduce((a, k) => (a == null ? undefined : a[k]), o);\nconst mins = s => (s == null ? undefined : Math.round(s / 60));\nconst hours = s => (s == null ? undefined : Math.round(s / 360) / 10);\n\nconst mappers = {\n  dailysummaries: r => {\n    const mv = obj(r.movement);\n    return {\n      steps: g(mv, 'steps.value'),\n      steps_goal: g(mv, 'steps.goal'),\n      distance_m: g(mv, 'steps.distanceInMeters'),\n      floors_up: g(mv, 'floorsAscended.value'),\n      calories_resting: g(r, 'calories.burnedResting'),\n      calories_active: g(r, 'calories.burnedActive'),\n      calories_total: g(r, 'calories.burnedTotal'),\n      hr_resting: g(r, 'heartRate.restingValue'),\n      hr_min: g(r, 'heartRate.minValue'),\n      hr_max: g(r, 'heartRate.maxValue'),\n      intensity_moderate: g(r, 'intensityMinutes.moderate'),\n      intensity_vigorous: g(r, 'intensityMinutes.vigorous'),\n      intensity_goal: g(r, 'intensityMinutes.goal'),\n      stress_avg: g(r, 'stress.avgLevel'),\n      stress_max: g(r, 'stress.maxLevel'),\n      stress_qualifier: g(r, 'stress.qualifier'),\n      bb_min: g(r, 'bodyBattery.minValue'),\n      bb_max: g(r, 'bodyBattery.maxValue'),\n      bb_charged: g(r, 'bodyBattery.chargedValue'),\n      bb_drained: g(r, 'bodyBattery.drainedValue'),\n      bb_latest: g(r, 'bodyBattery.latestValue'),\n      resp_avg: g(r, 'respiration.avgValue'),\n      resp_min: g(r, 'respiration.minValue'),\n      resp_max: g(r, 'respiration.maxValue'),\n      hydration_ml: g(r, 'hydration.consumedInMl'),\n      hydration_goal_ml: g(r, 'hydration.goalInMl')\n    };\n  },\n  sleep: r => ({\n    sleep_hours: hours(r.sleepTimeSeconds),\n    sleep_deep_min: mins(r.deepSleepSeconds),\n    sleep_light_min: mins(r.lightSleepSeconds),\n    sleep_rem_min: mins(r.remSleepSeconds),\n    sleep_awake_min: mins(r.awakeSleepSeconds),\n    sleep_score: g(r, 'sleepScores.overall.value'),\n    sleep_score_label: g(r, 'sleepScores.overall.qualifierKey'),\n    sleep_feedback: r.sleepScoreFeedback,\n    sleep_avg_hr: r.avgHeartRate,\n    sleep_avg_stress: r.avgSleepStress,\n    sleep_resp_avg: r.averageRespirationValue,\n    sleep_awake_count: r.awakeCount,\n    sleep_need_min: g(r, 'sleepNeed.actual')\n  }),\n  hrv: r => ({\n    hrv_last_night: r.lastNightAvg,\n    hrv_weekly_avg: r.weeklyAvg,\n    hrv_5min_high: r.lastNight5MinHigh,\n    hrv_baseline_low: g(r, 'baseline.balancedLow'),\n    hrv_baseline_high: g(r, 'baseline.balancedUpper'),\n    hrv_status: r.status\n  }),\n  fitnessage: r => {\n    let s = JSON.stringify(r);\n    if (s.length > 45000) s = JSON.stringify({ truncated: true });\n    return { fitnessage_raw: s };\n  }\n};\n\nconst rows = {};\nlet firstError = null;\nres.forEach((r, i) => {\n  if (!r.json || r.json.error) {\n    firstError = firstError || JSON.stringify((r.json || {}).error || 'empty item').slice(0, 300);\n    return;\n  }\n  const p = Array.isArray(r.pairedItem) ? r.pairedItem[0] : r.pairedItem;\n  const idx = p && p.item !== undefined ? p.item : i;\n  const req = (reqs[idx] || {}).json;\n  if (!req || !mappers[req.name]) return;\n  const body = unwrap(r.json);\n  const recs = req.day ? [body] : expand(body);\n  for (const rec of recs) {\n    if (!rec || typeof rec !== 'object') continue;\n    const d = req.forceDay ? req.day : String(rec.calendarDate || rec.date || '').slice(0, 10);\n    if (!d) continue;\n    const row = rows[d] || (rows[d] = { Date: d });\n    const fields = mappers[req.name](rec);\n    for (const [k, v] of Object.entries(fields)) {\n      if (v !== undefined && v !== null) row[k] = v;\n    }\n    row.updated_at = new Date().toISOString();\n  }\n});\nconst out = Object.values(rows).map(json => ({ json }));\nif (!out.length) throw new Error('No daily rows produced. First error: ' + firstError);\nreturn out;"
+      },
+      "id": "755cf720-2075-4d60-b7ca-3a1a7f88f05c",
+      "name": "Rows Daily",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1264,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const reqs = $('Build Requests').all();\nconst res = $input.all();\nconst unwrap = j => {\n  let b = (j && j.body !== undefined) ? j.body : j;\n  if (typeof b === 'string') { try { b = JSON.parse(b); } catch (e) {} }\n  return b;\n};\nconst expand = b => Array.isArray(b) ? b\n  : (b && typeof b === 'object' ? (Object.values(b).find(v => Array.isArray(v)) || [b]) : []);\nconst r1 = x => (x == null ? '' : Math.round(x * 10) / 10);\nconst r0 = x => (x == null ? '' : Math.round(x));\nconst mins = x => (x == null ? '' : Math.round(x / 6) / 10);\n\nconst out = [];\nconst seen = new Set();\nres.forEach((r, i) => {\n  if (!r.json || r.json.error) return;\n  const p = Array.isArray(r.pairedItem) ? r.pairedItem[0] : r.pairedItem;\n  const idx = p && p.item !== undefined ? p.item : i;\n  const req = (reqs[idx] || {}).json;\n  if (!req || req.name !== 'activities') return;\n  for (const a of expand(unwrap(r.json))) {\n    if (!a || typeof a !== 'object' || a.activityId == null) continue;\n    const id = String(a.activityId);\n    if (seen.has(id)) continue;\n    seen.add(id);\n    const speed = a.averageSpeed;\n    const type = a.activityType && a.activityType.typeKey || '';\n    out.push({ json: {\n      Date: String(a.startTimeLocal || '').slice(0, 10),\n      ActivityID: id,\n      start_local: a.startTimeLocal || '',\n      name: a.activityName || '',\n      type,\n      event_type: a.eventType && a.eventType.typeKey || '',\n      distance_km: a.distance == null ? '' : Math.round(a.distance / 10) / 100,\n      duration_min: mins(a.duration),\n      moving_min: mins(a.movingDuration),\n      elapsed_min: mins(a.elapsedDuration),\n      elevation_gain_m: r0(a.elevationGain),\n      avg_speed_kmh: speed == null ? '' : r1(speed * 3.6),\n      max_speed_kmh: a.maxSpeed == null ? '' : r1(a.maxSpeed * 3.6),\n      pace_sec_per_km: (speed && type.includes('running')) ? Math.round(1000 / speed) : '',\n      avg_hr: r0(a.averageHR),\n      max_hr: r0(a.maxHR),\n      avg_power: r0(a.avgPower),\n      norm_power: r0(a.normPower),\n      max_power: r0(a.maxPower),\n      max_20min_power: r0(a.max20MinPower),\n      tss: r1(a.trainingStressScore),\n      intensity_factor: a.intensityFactor == null ? '' : Math.round(a.intensityFactor * 100) / 100,\n      aerobic_te: r1(a.aerobicTrainingEffect),\n      anaerobic_te: r1(a.anaerobicTrainingEffect),\n      training_load: r1(a.activityTrainingLoad),\n      training_effect_label: a.trainingEffectLabel || '',\n      bike_cadence: r0(a.averageBikingCadenceInRevPerMinute),\n      run_cadence: r0(a.averageRunningCadenceInStepsPerMinute),\n      calories: r0(a.calories),\n      power_z1_min: mins(a.powerTimeInZone_1),\n      power_z2_min: mins(a.powerTimeInZone_2),\n      power_z3_min: mins(a.powerTimeInZone_3),\n      power_z4_min: mins(a.powerTimeInZone_4),\n      power_z5_min: mins(a.powerTimeInZone_5),\n      power_z6_min: mins(a.powerTimeInZone_6),\n      power_z7_min: mins(a.powerTimeInZone_7),\n      updated_at: new Date().toISOString()\n    } });\n  }\n});\nreturn out;"
+      },
+      "id": "7e609933-4a91-46d8-9e9b-bea42b64c16a",
+      "name": "Rows Activities",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1264,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Daily",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": null,
+          "matchingColumns": [
+            "Date"
+          ],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "c7230db5-d8b8-440f-8535-570a5b311550",
+      "name": "Write Daily",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1488,
+        144
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Activities",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": null,
+          "matchingColumns": [
+            "ActivityID"
+          ],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "4f111511-10ec-4035-b422-ae8f769262d5",
+      "name": "Write Activities",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1488,
+        384
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "const reqs = $('Build Requests').all();\nconst stats = {};\n$input.all().forEach((r, i) => {\n  const p = Array.isArray(r.pairedItem) ? r.pairedItem[0] : r.pairedItem;\n  const idx = p && p.item !== undefined ? p.item : i;\n  const name = reqs[idx] ? reqs[idx].json.name : 'unmatched';\n  const s = stats[name] || (stats[name] = { name, ok: 0, failed: 0, first_error: '' });\n  if (!r.json || r.json.error) {\n    s.failed++;\n    if (!s.first_error) {\n      const e = (r.json || {}).error || {};\n      s.first_error = String(e.message || 'empty item').slice(0, 160);\n    }\n  } else { s.ok++; }\n});\nreturn Object.values(stats).map(json => ({ json }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        640
+      ],
+      "id": "94a95ef7-db65-48ba-9c89-0f4f0a305ce2",
+      "name": "Diagnose",
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "content": "## Garmin to Google Sheets: your last 365 days\nPulls your own sleep, HRV, daily health data and activities from Garmin into a Google Sheet. Reruns update rows, they never duplicate. **Personal use only: use your own key and your own data.**\n\n### Setup (about 5 minutes)\n1. Create your Garmin Personal API key (it is shown only once, copy it): https://connect.garmin.com/app/settings/personalApiToken\n2. Open **Get Garmin Token** and create a Header Auth credential. Name: `Authorization`. Value: `ApiKey YOUR_KEY` (one space after ApiKey).\n3. Copy the sheet template: PASTE-YOUR-SHEET-COPY-LINK-HERE\n4. Open **Write Daily** and **Write Activities**: connect your Google account, choose your copy of the sheet, then click the refresh icon so n8n reads the headers.\n5. Click **Execute workflow** and wait a few minutes.",
+        "height": 380,
+        "width": 640,
+        "color": 4
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        160,
+        -330
+      ],
+      "id": "c99666e3-20e7-473f-aad8-aa35759dcad3",
+      "name": "Start here"
+    },
+    {
+      "parameters": {
+        "content": "### Garmin key\nHeader Auth credential:\nName = `Authorization`\nValue = `ApiKey ` + your key\nThe key stays in n8n and is never written into the workflow.",
+        "height": 130,
+        "width": 280,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        330,
+        120
+      ],
+      "id": "3da5f04a-3686-4350-b052-ed0f3c79c7ab",
+      "name": "Garmin key"
+    },
+    {
+      "parameters": {
+        "content": "### Good to know\n- Requests go out slowly on purpose (one every 2 seconds). If Garmin answers 429 (too many requests), just run again: rows are updated, not duplicated.\n- Change the period with `TOTAL_DAYS` in **Build Requests** (365 by default).\n- Garmin tokens last 24 hours; the workflow asks for a new one on every run.\n- Daily rows match on `Date`, activities on `ActivityID`.",
+        "height": 200,
+        "width": 440,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        800,
+        -140
+      ],
+      "id": "2ff104a6-92be-4c70-890e-84427c87695c",
+      "name": "Good to know"
+    },
+    {
+      "parameters": {
+        "content": "### Sheet headers (row 1, exactly these names)\nThe sheet template already has them. n8n only fills columns whose header exists.\n\n**Daily tab:** Date, steps, steps_goal, distance_m, floors_up, calories_resting, calories_active, calories_total, hr_resting, hr_min, hr_max, intensity_moderate, intensity_vigorous, intensity_goal, stress_avg, stress_max, stress_qualifier, bb_min, bb_max, bb_charged, bb_drained, bb_latest, resp_avg, resp_min, resp_max, hydration_ml, hydration_goal_ml, sleep_hours, sleep_deep_min, sleep_light_min, sleep_rem_min, sleep_awake_min, sleep_score, sleep_score_label, sleep_feedback, sleep_avg_hr, sleep_avg_stress, sleep_resp_avg, sleep_awake_count, sleep_need_min, hrv_last_night, hrv_weekly_avg, hrv_5min_high, hrv_baseline_low, hrv_baseline_high, hrv_status, fitnessage_raw, updated_at\n\n**Activities tab:** Date, ActivityID, start_local, name, type, event_type, distance_km, duration_min, moving_min, elapsed_min, elevation_gain_m, avg_speed_kmh, max_speed_kmh, pace_sec_per_km, avg_hr, max_hr, avg_power, norm_power, max_power, max_20min_power, tss, intensity_factor, aerobic_te, anaerobic_te, training_load, training_effect_label, bike_cadence, run_cadence, calories, power_z1_min, power_z2_min, power_z3_min, power_z4_min, power_z5_min, power_z6_min, power_z7_min, updated_at",
+        "height": 470,
+        "width": 620,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        -440
+      ],
+      "id": "68bd742c-f041-45f4-873f-d3d25c109e70",
+      "name": "Sheet headers"
+    },
+    {
+      "parameters": {
+        "content": "### Optional\nEnable **Diagnose** to see how many requests per endpoint succeeded or failed.",
+        "height": 110,
+        "width": 320,
+        "color": 3
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1200,
+        720
+      ],
+      "id": "655888f2-e745-4f68-a92c-3c24afc4fe5b",
+      "name": "Diagnose note"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Garmin Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Garmin Token": {
+      "main": [
+        [
+          {
+            "node": "Extract Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Token": {
+      "main": [
+        [
+          {
+            "node": "Build Requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Requests": {
+      "main": [
+        [
+          {
+            "node": "Get Garmin Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Garmin Data": {
+      "main": [
+        [
+          {
+            "node": "Rows Daily",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Rows Activities",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Diagnose",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rows Daily": {
+      "main": [
+        [
+          {
+            "node": "Write Daily",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rows Activities": {
+      "main": [
+        [
+          {
+            "node": "Write Activities",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": []
+}
